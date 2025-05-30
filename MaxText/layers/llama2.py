@@ -28,13 +28,12 @@ from jax.sharding import Mesh
 from flax import linen as nn
 
 from MaxText.inference import page_manager
-from MaxText.layers import linears
 from MaxText.layers import models
 from MaxText.layers import quantizations
 from MaxText.layers.attentions import Attention
 from MaxText.layers.quantizations import AqtQuantization as Quant
-from MaxText.layers.normalizations import RMSNorm
-
+from MaxText.layers.normalizations import RMSNorm, get_norm_layer
+from MaxText.layers.linears import get_mlp_block
 
 # -----------------------------------------
 # The Decoder Layer specific for Llama2
@@ -64,8 +63,9 @@ class LlamaDecoderLayer(nn.Module):
     mesh = self.mesh
 
     inputs = nn.with_logical_constraint(inputs, ("activation_batch", "activation_norm_length", "activation_embed"))
+
     inputs = checkpoint_name(inputs, "decoder_layer_input")
-    lnx_rms = RMSNorm(
+    lnx_rms = get_norm_layer(cfg)(
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
         name="pre_self_attention_layer_norm",
@@ -120,7 +120,7 @@ class LlamaDecoderLayer(nn.Module):
     intermediate_inputs = inputs + attention_lnx
 
     # Fully Connected
-    hidden_states = models.RMSNorm(
+    hidden_states = get_norm_layer(cfg)(
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
         name="post_self_attention_layer_norm",
@@ -132,7 +132,7 @@ class LlamaDecoderLayer(nn.Module):
     )
 
     # MLP block.
-    mlp_lnx = linears.MlpBlock(
+    mlp_lnx = get_mlp_block(cfg)(
         intermediate_dim=cfg.mlp_dim,
         activations=cfg.mlp_activations,
         intermediate_dropout_rate=cfg.dropout_rate,

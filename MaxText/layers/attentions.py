@@ -1311,6 +1311,7 @@ class Attention(nn.Module):
         quant=self.quant,
         matmul_precision=self.config.matmul_precision,
         use_bias=self.use_bias_in_projections,
+        dot_kernel="te_dot" if self.config.te_dense_general else None
     )(inputs_q)
     return query_proj
 
@@ -1348,6 +1349,7 @@ class Attention(nn.Module):
         quant=self.quant,
         matmul_precision=self.config.matmul_precision,
         use_bias=self.use_bias_in_projections,
+        dot_kernel="te_dot" if self.config.te_dense_general else None
     )(inputs_kv)
     return kv_proj
 
@@ -1365,6 +1367,7 @@ class Attention(nn.Module):
         quant=self.quant,
         matmul_precision=self.config.matmul_precision,
         use_bias=self.use_bias_in_projections,
+        dot_kernel="te_dot" if self.config.te_dense_general else None
     )(inputs)
     qkv_proj = checkpoint_name(qkv_proj, "qkv_proj")
     query, key, value = qkv_proj[:, :, 0, ...], qkv_proj[:, :, 1, ...], qkv_proj[:, :, 2, ...]
@@ -1378,6 +1381,7 @@ class Attention(nn.Module):
     out_proj = DenseGeneral(
         features=output_dim,
         axis=(-2, -1),
+        # axis=-1,
         kernel_init=self.kernel_init,
         kernel_axes=out_kernel_axis,  # trade speed with memory
         dtype=self.dtype,
@@ -1386,6 +1390,7 @@ class Attention(nn.Module):
         quant=self.quant,
         matmul_precision=self.config.matmul_precision,
         use_bias=self.use_bias_in_projections,
+        dot_kernel="te_dot" if self.config.te_dense_general else None
     )(out)
     return out_proj
 

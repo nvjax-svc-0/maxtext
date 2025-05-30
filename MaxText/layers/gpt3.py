@@ -319,7 +319,7 @@ class Gpt3DecoderLayer(nn.Module):
     attention_lnx += inputs
 
     # MLP block.
-    mlp_lnx = linears.MlpBlock(
+    mlp_lnx = linears.get_mlp_block(cfg)(
         intermediate_dim=cfg.mlp_dim,
         activations=cfg.mlp_activations,
         intermediate_dropout_rate=cfg.dropout_rate,

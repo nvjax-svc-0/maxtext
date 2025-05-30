@@ -283,6 +283,7 @@ def dpo_loss_fn(model, config, data, dropout_rng, params, reference_params, is_t
       enable_dropout=config.enable_dropout if is_train else False,
       rngs={"dropout": rng1, "params": aqt_rng},
       mutable="intermediates",
+      # mutable=nn.DenyList([]),
   )
   ref_logits = model.apply(
       {"params": reference_params},
@@ -391,6 +392,7 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
       enable_dropout=config.enable_dropout if is_train else False,
       rngs={"dropout": rng1, "params": aqt_rng},
       mutable="intermediates",
+      # mutable=nn.DenyList([]),
   )
   one_hot_targets = jax.nn.one_hot(data["targets"], config.vocab_size)
   xent, _ = max_utils.cross_entropy_with_logits(logits, one_hot_targets, 0.0)
@@ -484,9 +486,9 @@ def train_step(model, config, state_mesh_shardings, state, data, dropout_rng):
   moe_lb_loss = aux["moe_lb_loss"]
 
   if config.gradient_clipping_threshold > 0:
-    grads = maxtext_utils.apply_gradient_clipping(raw_grads, state, config.gradient_clipping_threshold)
-  else:
-    grads = raw_grads
+    raw_grads['params'] = maxtext_utils.apply_gradient_clipping(raw_grads['params'], state, config.gradient_clipping_threshold)
+  grads = raw_grads
+
   if config.optimizer_memory_host_offload:
     state = state.replace(
         opt_state=jax.device_put(
@@ -508,7 +510,14 @@ def train_step(model, config, state_mesh_shardings, state, data, dropout_rng):
             jax.tree_util.tree_map_with_path(move, state_mesh_shardings.params),
         )
     )
+  # jax.debug.print()
+  # var_collect, grads = flax.core.pop(grads, "params")
+  # jax.debug.print('{}', grads['params'])
   new_state = state.apply_gradients(grads=grads)
+  if config.te_fp8 and "fp8_metas" in grads:
+    new_state.params['fp8_metas'] = grads["fp8_metas"]
+    # Following is probably a nicer looking version
+    # new_state = new_state.replace(params={**new_state.params, 'fp8_metas':raw_grads["fp8_metas"]})
 
   scalar_metrics = {
       "learning/loss": loss,
@@ -882,7 +891,17 @@ def train_loop(config, state=None):
       # pylint: disable=not-callable
       nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
       record_goodput(recorder, config, recorder.record_step_start_time if recorder else None, step)
+
+      def check_fp8_call(lowered):
+        import re
+        hlo = lowered.compile()
+        if re.search(r"custom-call\(f8e4m3fn.*, f8e4m3fn.*", hlo.as_text()):
+          print("Fp8 call detected!")
+        else:
+          print("No Fp8 call!")
+
       with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+        # check_fp8_call(p_train_step.lower(state, example_batch, nextrng))
         state, metrics = p_train_step(state, example_batch, nextrng)
 
     step_time_delta = datetime.datetime.now() - last_step_completion
@@ -1052,8 +1071,27 @@ def main(argv: Sequence[str]) -> None:
       )
   )
   diagnostic_config = diagnostic_configuration.DiagnosticConfig(debug_config)
-  with diagnostic.diagnose(diagnostic_config):
-    train_loop(config)
+
+  from transformer_engine.jax import fp8_autocast
+  import transformer_engine.jax as te
+  from transformer_engine.common import recipe
+
+  te_recipe = None
+  if config.te_fp8:
+    if config.te_recipe == "DelayedScaling":
+      te_recipe = recipe.DelayedScaling()
+    elif config.te_recipe == "MXFP8BlockScaling":
+      te_recipe = recipe.MXFP8BlockScaling()
+    elif config.te_recipe == "Float8CurrentScaling":
+      te_recipe = recipe.Float8CurrentScaling()
+    else:
+      raise ValueError(f"Unsupported TE recipe: {config.te_recipe}")
+
+  # NOTE: mesh_resource=te.MeshResource("embed", "mlp", None, None) is not used.
+  #       Is it needed?
+  with fp8_autocast(enabled=config.te_fp8, fp8_recipe=te_recipe):
+    with diagnostic.diagnose(diagnostic_config):
+      train_loop(config)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-base_config: "base.yml"
+base_config: "base_edited.yml"
 
 run_name: "gpu_train_test"
 hardware: "gpu"

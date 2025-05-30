@@ -36,7 +36,7 @@ from MaxText.layers import pipeline
 from MaxText import maxtext_utils
 from MaxText import multimodal_utils
 from MaxText.layers.attentions import Attention
-from MaxText.layers.normalizations import RMSNorm
+from MaxText.layers.normalizations import RMSNorm, get_norm_layer
 from MaxText.layers.embeddings import PositionalEmbedding, Embed
 from MaxText.layers.quantizations import AqtQuantization as Quant
 
@@ -200,7 +200,7 @@ class Decoder(nn.Module):
   def setup(self):
     """Initialize decoder layer."""
     self.decoder_layer = self.get_decoder_layers()
-    self.norm_layer = self.get_norm_layer()
+    self.norm_layer = get_norm_layer(self.config)
     if self.config.using_pipeline_parallelism:
       pipeline_stage_module = self.get_pipeline_stage_module(self.decoder_layer)
       remat_policy = self.get_remat_policy()
@@ -365,33 +365,11 @@ class Decoder(nn.Module):
     else:
       raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block.value=}")
 
-  def get_norm_layer(self):
-    """get normalization layer (return type inherits from nn.Module)"""
-    if self.config.decoder_block in (
-        DecoderBlockType.DEFAULT,
-        DecoderBlockType.LLAMA2,
-        DecoderBlockType.MISTRAL,
-        DecoderBlockType.MIXTRAL,
-        DecoderBlockType.DEEPSEEK,
-        DecoderBlockType.GEMMA,
-        DecoderBlockType.GEMMA2,
-        DecoderBlockType.GEMMA3,
-        DecoderBlockType.SIMPLE,
-        DecoderBlockType.SIMPLE_MLP,
-        DecoderBlockType.LLAMA4,
-    ):
-      return RMSNorm
-    elif self.config.decoder_block == DecoderBlockType.GPT3:
-      from MaxText.layers import gpt3  # pylint: disable=import-outside-toplevel
-
-      return functools.partial(gpt3.Gpt3LayerNorm, reductions_in_fp32=False, use_bias=True)
-    else:
-      raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block.value=}")
-
   def scan_decoder_layers(self, cfg, decoder_layer, length, metdata_axis_name, mesh, **kwargs):
     """scan decoder layers, calls `flax.linen.transforms.scan`"""
     initializing = self.is_mutable_collection("params")
     params_spec = cfg.param_scan_axis if initializing else ScanIn(cfg.param_scan_axis)
+    fp8_metas_spec = cfg.param_scan_axis if initializing else ScanIn(cfg.param_scan_axis)
     cache_spec = 0
     scan_fn = nn.scan(
         decoder_layer,
@@ -401,7 +379,9 @@ class Decoder(nn.Module):
             "intermediates": 0,
             "aqt": 0,
             "_overwrite_with_gradient": 0,
+            "fp8_metas": fp8_metas_spec,
         },
+        # variable_carry=["fp8_metas"], # adding this didn't seem to make `fp8_metas` appear in the params
         split_rngs={
             "params": True,
             "dropout": cfg.enable_dropout,
@@ -645,7 +625,7 @@ class Decoder(nn.Module):
                 slot=slot,
                 **layer_call_kwargs,
             )
-    y = self.get_norm_layer()(
+    y = get_norm_layer(cfg)(
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
         name="decoder_norm",

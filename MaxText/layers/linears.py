@@ -30,7 +30,7 @@ import flax.linen as nn
 from MaxText import max_logging
 from MaxText.common_types import DecoderBlockType, DType, Array, Config
 from MaxText.layers import quantizations
-from MaxText.layers.normalizations import RMSNorm
+from MaxText.layers.normalizations import RMSNorm, get_norm_layer
 from MaxText.layers.initializers import NdInitializer, nd_dense_init, default_bias_init
 from MaxText.layers.quantizations import AqtQuantization as Quant
 
@@ -96,6 +96,7 @@ class DenseGeneral(nn.Module):
   use_bias: bool = False
   matmul_precision: str = "default"
   parameter_memory_host_offload: bool = False
+  dot_kernel: str = "te_dot"
 
   @nn.compact
   def __call__(self, inputs: Array) -> Array:
@@ -117,11 +118,48 @@ class DenseGeneral(nn.Module):
     kernel_shape = tuple(inputs.shape[ax] for ax in axis) + features
     kernel_in_axis = np.arange(len(axis))
     kernel_out_axis = np.arange(len(axis), len(axis) + len(features))
-    if quantizations.in_serve_mode(self.quant):
-      # During aqt convert state we delete kernel weight from params to save memory.
-      # Instead they are retrieved from the tensors stored in the 'aqt' collection.
-      kernel = jnp.zeros(kernel_shape)
+
+    if self.dot_kernel == "te_dot":
+      # This import is only meant to work in a GPU build
+      from transformer_engine.jax.flax.module import DenseGeneral as TEDenseGeneral
+
+      def TE_kernel_init(rng, shape, dtype):
+        return self.kernel_init(rng, shape, dtype, kernel_in_axis, kernel_out_axis)
+
+      # NOTE: This is not needed since TE should be aware of the provided axis and not the
+      #       other way around. But keeping this here to confirm before removing.
+      # def replace_kernel_axes(kernel_axes):
+      #   from transformer_engine.jax.sharding import W_FSDP_AXES, W_TP_AXES, HIDDEN_TP_AXES, HEAD_AXES
+      #   maxtext_to_te_axes = {
+      #     "embed": W_FSDP_AXES,
+      #     "mlp": W_TP_AXES,
+      #     "kv_head_dim": HIDDEN_TP_AXES,
+      #     "kv": HIDDEN_TP_AXES,
+      #     "kv_heads": HEAD_AXES,
+      #     "q_heads": HEAD_AXES,
+      #     "heads": HEAD_AXES,
+      #   }
+      #   return _canonicalize_tuple(maxtext_to_te_axes[ax] for ax in kernel_axes)
+
+      # TODO: self.quant is not handled yet
+      te_dense_general = TEDenseGeneral(
+          features=self.features,
+          kernel_init=TE_kernel_init,
+          kernel_axes=self.kernel_axes,
+          use_bias=self.use_bias,
+          axis=self.axis,
+          dtype=self.weight_dtype,
+          name=self.name,
+          # dtype=self.dtype,
+      )
+      # Cast the inputs into required activation dtype.
+      inputs = jnp.asarray(inputs, dtype=self.dtype)
+      output = te_dense_general(inputs)
     else:
+      if quantizations.in_serve_mode(self.quant):
+        # During aqt convert state we delete kernel weight from params to save memory.
+        # Instead they are retrieved from the tensors stored in the 'aqt' collection.
+        kernel = jnp.zeros(kernel_shape)
       kernel = self.param(
           "kernel",
           nn.with_logical_partitioning(self.kernel_init, self.kernel_axes),
@@ -130,13 +168,13 @@ class DenseGeneral(nn.Module):
           kernel_in_axis,
           kernel_out_axis,
       )
-    # Move logit_dense kernel to device if parameter offloading is enabled
-    if self.parameter_memory_host_offload:
-      max_logging.log("linear.py: Moving parameter logits_dense kernel to device")
-      kernel = jax.device_put(kernel, jax._src.sharding_impls.TransferToMemoryKind("device"))
-    kernel = jnp.asarray(kernel, self.dtype)
-    contract_ind = tuple(range(0, len(axis)))
-    output = _compute_dot_general(inputs, kernel, self.kernel_axes, axis, contract_ind, self.matmul_precision, self.quant)
+      # Move logit_dense kernel to device if parameter offloading is enabled
+      if self.parameter_memory_host_offload:
+        max_logging.log("linear.py: Moving parameter logits_dense kernel to device")
+        kernel = jax.device_put(kernel, jax._src.sharding_impls.TransferToMemoryKind("device"))
+      kernel = jnp.asarray(kernel, self.dtype)
+      contract_ind = tuple(range(0, len(axis)))
+      output = _compute_dot_general(inputs, kernel, self.kernel_axes, axis, contract_ind, self.matmul_precision, self.quant)
 
     if self.use_bias:
       bias_axes, bias_shape = (
@@ -153,6 +191,75 @@ class DenseGeneral(nn.Module):
       output += bias
     return output
 
+from transformer_engine.jax.flax.module import LayerNormMLP
+from transformer_engine.jax.flax.module import DenseGeneral as TEDenseGeneral
+import inspect
+
+class TENormMLPWrapper(LayerNormMLP):
+  def __new__(cls, *args, **kwargs):
+
+    signature = inspect.signature(LayerNormMLP.__init__)
+    lnmlp_expected_args = {
+      key:value for key,value in kwargs.items() if key in signature
+    }
+
+    te_lnmlp_initialized = LayerNormMLP(**lnmlp_expected_args)
+
+    return te_lnmlp_initialized
+
+  @nn.compact
+  def __call__(self, inputs: Array, deterministic: bool = False):
+    ## Can't do this due to dep1 above
+    # x = jnp.asarray(x, self.jax_activation_dtype)
+    return super().__call__(inputs, deterministic=deterministic)
+
+## While the above class based wrapper doesn't work, use this
+def get_mlp_block(cfg):
+  def te_mlp_block_wrapper(*args, **kwargs):
+    signature = inspect.signature(LayerNormMLP.__init__)
+    lnmlp_expected_args = {
+      key:value for key,value in kwargs.items() if key in signature.parameters
+    }
+    lnmlp_expected_args["dtype"] = kwargs["weight_dtype"]
+    lnmlp_expected_args["layernorm_type"] = "rmsnorm"
+    lnmlp_expected_args["kernel_axes_1"] = ("embed", None, "mlp")
+    lnmlp_expected_args["kernel_axes_2"] = ("mlp", "embed")
+    te_lnmlp_initialized = LayerNormMLP(**lnmlp_expected_args)
+
+
+    def apply_te_mlp(inputs: Array, deterministic: bool = False):
+      inputs = jnp.asarray(inputs, dtype=kwargs["dtype"])
+      outputs = te_lnmlp_initialized(inputs, deterministic=deterministic)
+      return outputs[0]
+
+    return apply_te_mlp
+
+  return te_mlp_block_wrapper if cfg.te_mlp else MlpBlock
+
+## For TE DenseGeneral, kernel_init doesn't work since it needs additional
+## arguments - kernel_in_axis and kernel_out_axis that are not accessible
+## in this wrapper function. Need to think more on this.
+def get_dense_general(cfg):
+  def te_dense_general_wrapper(*args, **kwargs):
+    signature = inspect.signature(TEDenseGeneral.__init__)
+    dense_expected_args = {
+      key:value for key,value in kwargs.items() if key in signature.parameters
+    }
+    # dense_expected_args["features"] = kwargs["features"]
+    dense_expected_args["dtype"] = kwargs["weight_dtype"]
+
+    te_dense_general_initialized = TEDenseGeneral(*args, **dense_expected_args)
+
+    # te_dense_general_initialized
+
+    def apply_te_dense_general(inputs: Array, deterministic: bool = False):
+      inputs = jnp.asarray(inputs, dtype=kwargs["dtype"])
+      outputs = te_dense_general_initialized(inputs, deterministic=deterministic)
+      return outputs[0]
+
+    return apply_te_dense_general
+
+  return te_dense_general_wrapper if cfg.te_dense_general else DenseGeneral
 
 class MlpBlock(nn.Module):
   """Transformer MLP / feed-forward block.
@@ -182,32 +289,13 @@ class MlpBlock(nn.Module):
   use_pre_norm: bool = False
   quant: Optional[Quant] = None
 
-  def get_norm_layer(self):
-    """get normalization layer."""
-    if self.config.decoder_block in (
-        DecoderBlockType.DEFAULT,
-        DecoderBlockType.LLAMA2,
-        DecoderBlockType.MISTRAL,
-        DecoderBlockType.MIXTRAL,
-        DecoderBlockType.GEMMA,
-        DecoderBlockType.DEEPSEEK,
-        DecoderBlockType.LLAMA4,
-    ):
-      return RMSNorm
-    elif self.config.decoder_block == DecoderBlockType.GPT3:
-      from MaxText.layers import gpt3  # pylint: disable=import-outside-toplevel
-
-      return functools.partial(gpt3.Gpt3LayerNorm, reductions_in_fp32=False, use_bias=self.use_bias)
-    else:
-      raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block.value=}")
-
   @nn.compact
   def __call__(self, inputs, decode: bool = False, deterministic: bool = False):
     """Applies Transformer MlpBlock module."""
     cfg = self.config
 
     if self.use_pre_norm:
-      inputs = self.get_norm_layer()(
+      inputs = get_norm_layer(cfg)(
           name="mlp_layer_norm",
           dtype=cfg.dtype,
           weight_dtype=cfg.weight_dtype,
@@ -247,6 +335,7 @@ class MlpBlock(nn.Module):
             quant=self.quant,
             use_bias=self.use_bias,
             matmul_precision=self.config.matmul_precision,
+            dot_kernel="te_dot" if self.config.te_dense_general else None,
         )(inputs)
         x = checkpoint_name(x, "mlp" + dense_name)
         if cfg.activations_in_float32:
@@ -271,6 +360,7 @@ class MlpBlock(nn.Module):
         quant=self.quant,
         use_bias=self.use_bias,
         matmul_precision=self.config.matmul_precision,
+        dot_kernel="te_dot" if self.config.te_dense_general else None,
     )(x)
 
     output = checkpoint_name(output, "mlpwo")
