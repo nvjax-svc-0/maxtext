@@ -224,6 +224,7 @@ def get_mlp_block(cfg):
     lnmlp_expected_args["layernorm_type"] = "rmsnorm"
     lnmlp_expected_args["kernel_axes_1"] = ("embed", None, "mlp")
     lnmlp_expected_args["kernel_axes_2"] = ("mlp", "embed")
+    lnmlp_expected_args["return_layernorm_output"] = False
     te_lnmlp_initialized = LayerNormMLP(**lnmlp_expected_args)
 
 

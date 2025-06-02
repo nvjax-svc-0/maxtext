@@ -737,9 +737,3 @@ rope_theta_for_vit: 10000
 vision_output_dim_for_vit: 4096
 pixel_shuffle_ratio_for_vit: 0.5
 projector_dropout_for_vit: 0.0
-# Transformer Engine
-te_modules: False
-te_norm: False
-te_mlp: False
-te_dense_general: False
-te_fp8: False

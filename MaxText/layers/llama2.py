@@ -65,16 +65,19 @@ class LlamaDecoderLayer(nn.Module):
     inputs = nn.with_logical_constraint(inputs, ("activation_batch", "activation_norm_length", "activation_embed"))
 
     inputs = checkpoint_name(inputs, "decoder_layer_input")
-    lnx_rms = get_norm_layer(cfg)(
-        dtype=cfg.dtype,
-        weight_dtype=cfg.weight_dtype,
-        name="pre_self_attention_layer_norm",
-        kernel_axes=("norm",),
-        epsilon=cfg.normalization_layer_epsilon,
-    )
-    lnx = lnx_rms(inputs)
-
-    lnx = nn.with_logical_constraint(lnx, ("activation_batch", "activation_norm_length", "activation_embed"))
+    fuse_norm_with_qkv_proj = cfg.te_norm and cfg.te_dense_general
+    if not fuse_norm_with_qkv_proj:
+        lnx_rms = get_norm_layer(cfg)(
+            dtype=cfg.dtype,
+            weight_dtype=cfg.weight_dtype,
+            name="pre_self_attention_layer_norm",
+            kernel_axes=("norm",),
+            epsilon=cfg.normalization_layer_epsilon,
+        )
+        lnx = lnx_rms(inputs)
+        lnx = nn.with_logical_constraint(lnx, ("activation_batch", "activation_norm_length", "activation_embed"))
+    else:
+        lnx = inputs
 
     # Self-attention block
     attention_layer = Attention(
@@ -100,6 +103,7 @@ class LlamaDecoderLayer(nn.Module):
         reshape_q=cfg.reshape_q,
         use_ragged_attention=cfg.use_ragged_attention,
         ragged_block_size=cfg.ragged_block_size,
+        norm_inputs=fuse_norm_with_qkv_proj,
     )
 
     attention_lnx = attention_layer(
@@ -119,30 +123,44 @@ class LlamaDecoderLayer(nn.Module):
     )
     intermediate_inputs = inputs + attention_lnx
 
-    # Fully Connected
-    hidden_states = get_norm_layer(cfg)(
-        dtype=cfg.dtype,
-        weight_dtype=cfg.weight_dtype,
-        name="post_self_attention_layer_norm",
-        kernel_axes=("norm",),
-        epsilon=cfg.normalization_layer_epsilon,
-    )(intermediate_inputs)
-    hidden_states = nn.with_logical_constraint(
-        hidden_states, ("activation_batch", "activation_norm_length", "activation_embed")
-    )
+    if cfg.te_mlp:
+        # LN MLP block.
+        mlp_lnx = get_mlp_block(cfg)(
+            intermediate_dim=cfg.mlp_dim,
+            activations=cfg.mlp_activations,
+            intermediate_dropout_rate=cfg.dropout_rate,
+            dtype=cfg.dtype,
+            weight_dtype=cfg.weight_dtype,
+            name="mlp",
+            config=cfg,
+            quant=self.quant,
+        )(intermediate_inputs, deterministic=deterministic)
+        mlp_lnx = nn.with_logical_constraint(mlp_lnx, ("activation_batch", "activation_norm_length", "activation_embed"))
+    else:
+        # Fully Connected
+        hidden_states = get_norm_layer(cfg)(
+            dtype=cfg.dtype,
+            weight_dtype=cfg.weight_dtype,
+            name="post_self_attention_layer_norm",
+            kernel_axes=("norm",),
+            epsilon=cfg.normalization_layer_epsilon,
+        )(intermediate_inputs)
+        hidden_states = nn.with_logical_constraint(
+            hidden_states, ("activation_batch", "activation_norm_length", "activation_embed")
+        )
 
-    # MLP block.
-    mlp_lnx = get_mlp_block(cfg)(
-        intermediate_dim=cfg.mlp_dim,
-        activations=cfg.mlp_activations,
-        intermediate_dropout_rate=cfg.dropout_rate,
-        dtype=cfg.dtype,
-        weight_dtype=cfg.weight_dtype,
-        name="mlp",
-        config=cfg,
-        quant=self.quant,
-    )(hidden_states, deterministic=deterministic)
-    mlp_lnx = nn.with_logical_constraint(mlp_lnx, ("activation_batch", "activation_norm_length", "activation_embed"))
+        # MLP block.
+        mlp_lnx = get_mlp_block(cfg)(
+            intermediate_dim=cfg.mlp_dim,
+            activations=cfg.mlp_activations,
+            intermediate_dropout_rate=cfg.dropout_rate,
+            dtype=cfg.dtype,
+            weight_dtype=cfg.weight_dtype,
+            name="mlp",
+            config=cfg,
+            quant=self.quant,
+        )(hidden_states, deterministic=deterministic)
+        mlp_lnx = nn.with_logical_constraint(mlp_lnx, ("activation_batch", "activation_norm_length", "activation_embed"))
 
     layer_output = mlp_lnx + intermediate_inputs
 
