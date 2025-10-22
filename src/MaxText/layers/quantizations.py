@@ -1,4 +1,5 @@
 # Copyright 2023–2025 Google LLC
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -750,6 +751,7 @@ class TransformerEngineQuantization(Quantization):
       "te_fp8_delayedscaling": recipe.DelayedScaling,
       "te_fp8_currentscaling": recipe.Float8CurrentScaling,
       "te_mxfp8": recipe.MXFP8BlockScaling,
+      "te_nvfp4": recipe.NVFP4BlockScaling,
     }
     if recipe_name not in RECIPES:
       raise ValueError(f"Invalid TransformerEngine recipe: {recipe_name}")
@@ -763,6 +765,9 @@ class TransformerEngineQuantization(Quantization):
     from transformer_engine.common import recipe
     if isinstance(self._recipe, recipe.MXFP8BlockScaling):
       return 32
+    # TODO(Jeremy) Reduced the blocksize to 16 when non-fused RHT is supported.
+    if isinstance(self._recipe, recipe.NVFP4BlockScaling):
+      return 64
     return 1
 
   def _wrap(self, f, name = None):
@@ -824,7 +829,6 @@ class TransformerEngineQuantization(Quantization):
     """Placeholder for einsum implementation in subclasses."""
     # quant.einsum is only required for MoE or for inference with KVCache.
     raise ValueError("Einsum is not yet supported for TransformerEngine quantization.")
-
 
   def layernorm_mlp(self, mlp_block, rngs):
     """ Creates an NNX module for TransformerEngine's layernorm_mlp with support for fused norm+quantization and fused activation+quantization.

@@ -1,4 +1,5 @@
 # Copyright 2023–2025 Google LLC
+# Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -520,6 +521,7 @@ def transformer_engine_context():
     mesh_resource = MeshResource(
       dp_resource = "data",
       tp_resource = "tensor",
+      tpsp_resource = "tensor_sequence",
       fsdp_resource = "fsdp",
       pp_resource = None,
       cp_resource = "context",
