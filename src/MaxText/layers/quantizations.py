@@ -750,6 +750,7 @@ class TransformerEngineQuantization(Quantization):
       "te_fp8_delayedscaling": recipe.DelayedScaling,
       "te_fp8_currentscaling": recipe.Float8CurrentScaling,
       "te_mxfp8": recipe.MXFP8BlockScaling,
+      "te_nvfp4": recipe.NVFP4BlockScaling,
     }
     if recipe_name not in RECIPES:
       raise ValueError(f"Invalid TransformerEngine recipe: {recipe_name}")
@@ -763,6 +764,9 @@ class TransformerEngineQuantization(Quantization):
     from transformer_engine.common import recipe
     if isinstance(self._recipe, recipe.MXFP8BlockScaling):
       return 32
+    if isinstance(self._recipe, recipe.NVFP4BlockScaling):
+      # TODO(jberchtold): reduce to 16 when unfused RHT is supported
+      return 64
     return 1
 
   def _wrap(self, f, name = None):
@@ -792,7 +796,12 @@ class TransformerEngineQuantization(Quantization):
     class TEWrapper(te.flax.module.TransformerEngineBase):
       def generate_quantizer_set(self, postfix: str = ""):
         OVERWRITE_WITH_GRADIENT = "_overwrite_with_gradient"
-        return super().generate_quantizer_set(postfix=postfix, variable_collection=OVERWRITE_WITH_GRADIENT, fp8_recipe=fp8_recipe)
+        return super().generate_quantizer_set(
+          postfix=postfix,
+          variable_collection=OVERWRITE_WITH_GRADIENT,
+          quantization_checkpoint_name="quantization",
+          fp8_recipe=fp8_recipe,
+        )
 
       @nn.compact
       def __call__(self, *args, **kwargs):
