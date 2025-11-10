@@ -1,4 +1,16 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # Run MaxText with Transformer Engine (TE) across different parallelization strategies and quantization recipes
 # Usage: bash run_single_node_model_parallel.sh --model MODEL --output-dir-tag OUTPUT_DIR_TAG --trace true|false --steps STEPS --single-gpu-run true|false --num-decoder-layers N_LAYERS
@@ -160,7 +172,7 @@ trap restore_model_config_file EXIT
 BASE_ARGS="--model $MODEL --steps $STEPS"
 # Need to be with four escape quotes
 OTHER_ARGS="--additional-args=\"\"\"fused_mlp=true ${PROFILE_ARG}\"\"\""
-TRAINING_RECIPES=("fp8" "te_fp8_delayedscaling" "te_fp8_currentscaling" "te_mxfp8")   # fp8 is the MaxText baseline
+TRAINING_RECIPES=("fp8" "te_fp8_delayedscaling" "te_fp8_currentscaling" "te_mxfp8" "te_nvfp4")   # fp8 is the MaxText baseline
 
 export NVTE_JAX_CUSTOM_CALLS='NormFwdPrimitive=false,NormBwdPrimitive=false'
 
@@ -189,9 +201,8 @@ for ((i = start_index; i < ${#experiments[@]}; i++)); do
     test="${recipe}"
     run_and_parse "$test" "$dp" "$tpsp" "$fsdp" \
       "MAXTEXT_DIR=${MAXTEXT_DIR} bash test-maxtext.sh $args --quantization=${recipe} $BASE_ARGS ${OTHER_ARGS}"
-    done
   done
-
+done
 
 OUTPUT_FORMAT="txt" # txt or csv
 echo "=== Experiments finished. Raw CSV at $CSV"
