@@ -587,6 +587,9 @@ class _HyperParameters:
       jax.config.update("jax_debug_log_modules", raw_keys["jax_debug_log_modules"])
     max_utils.maybe_initialize_jax_distributed_system(raw_keys)
 
+    if raw_keys["use_te_comm_gemm_overlap"]:
+      max_utils.initialize_transformer_engine_comm_gemm_overlap(raw_keys)
+
     if raw_keys["jax_cache_dir"]:
       compilation_cache.set_cache_dir(os.path.expanduser(raw_keys["jax_cache_dir"]))
 

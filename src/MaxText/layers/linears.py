@@ -37,6 +37,23 @@ from MaxText.layers import nnx_wrappers, quantizations
 from MaxText.layers import normalizations
 from MaxText.layers.initializers import NdInitializer, nd_dense_init, default_bias_init, variable_to_logically_partitioned
 from MaxText.layers.quantizations import AqtQuantization as Quant
+from typing import Tuple
+
+try:
+    import transformer_engine.jax as te
+    from transformer_engine.jax.dense import dense as te_dense
+    from transformer_engine.jax.quantize import fp8_autocast
+    from transformer_engine.jax.sharding import MeshResource, global_shard_guard
+    import transformer_engine.jax.flax as te_flax
+    from transformer_engine.jax.cpp_extensions.gemm import collective_gemm_bootstrap
+    from transformer_engine.jax.cpp_extensions.gemm import (
+        CollectiveOp,
+        CollectiveOpSet,
+        noop_collective_op_set,
+    )
+
+except ImportError:
+    print("TransformerEngine not available - will only test native DenseGeneral")
 
 
 def _convert_to_activation_function(fn_or_string: str | Callable[..., Any]) -> Callable[..., Any]:
@@ -71,7 +88,7 @@ def _compute_dot_general(inputs, kernel, kernel_axes, axis, contract_ind, matmul
   dot_general = lax.dot_general
   matmul_precision = lax.Precision(matmul_precision)
   if quant:
-    dot_general_cls = quant.dot_general_cls(mesh_axes=kernel_axes)
+    dot_general_cls = quant.dot_general_cls(mesh_axes=kernel_axes, collective_op_set=self.collective_op_set)
     dot_general = dot_general_cls()
     return dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=None)
   return dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=matmul_precision)
@@ -108,6 +125,8 @@ class DenseGeneral(nnx.Module):
       parameter_memory_host_offload: bool = False,
       *,  # Following arguments are keyword-only
       rngs: nnx.Rngs = None,
+      use_te_comm_gemm_overlap: bool = False,
+      collective_op_set: CollectiveOpSet = None,
   ):
     """Initializes the DenseGeneral module.
 
@@ -137,6 +156,8 @@ class DenseGeneral(nnx.Module):
     self.use_bias = use_bias
     self.matmul_precision = matmul_precision
     self.parameter_memory_host_offload = parameter_memory_host_offload
+    self.use_te_comm_gemm_overlap = use_te_comm_gemm_overlap
+    self.collective_op_set = collective_op_set
 
     # Parameter initialization
     kernel_shape = self.in_features_shape + self.out_features_shape
@@ -214,6 +235,7 @@ class DenseGeneral(nnx.Module):
       kernel = jnp.asarray(kernel, self.dtype)
 
     contract_ind = tuple(range(0, len(self.axis)))
+
     output = _compute_dot_general_nnx(
         inputs,
         kernel,
@@ -334,6 +356,7 @@ class MlpBlock(nnx.Module):
       model_mode: None | str = None,
       *,
       rngs: nnx.Rngs,
+      collective_op_sets: Tuple = None,
   ) -> None:
     """A MlpBlock module.
 
@@ -366,7 +389,12 @@ class MlpBlock(nnx.Module):
     self.model_mode = model_mode
 
     self.te_ln_mlp = None
-    if self.config.quantization.startswith("te_"):
+    if self.config.quantization is None:
+        use_te = False
+    else:
+        use_te = self.config.quantization.startswith("te_")
+
+    if use_te:
       from flax import nnx
       self.te_ln_mlp = nnx.data(self.quant.layernorm_mlp(self, rngs=rngs))
       if self.te_ln_mlp is not None and self.intermediate_dropout_rate > 0.0:
@@ -396,6 +424,8 @@ class MlpBlock(nnx.Module):
           use_bias=self.use_bias,
           matmul_precision=self.config.matmul_precision,
           rngs=rngs,
+          use_te_comm_gemm_overlap=self.config.use_te_comm_gemm_overlap,
+          collective_op_set=None if not collective_op_sets else collective_op_sets[0],
       )
     else:
       for idx in range(len(self.activations)):
@@ -412,6 +442,8 @@ class MlpBlock(nnx.Module):
             use_bias=self.use_bias,
             matmul_precision=self.config.matmul_precision,
             rngs=rngs,
+            use_te_comm_gemm_overlap=self.config.use_te_comm_gemm_overlap if idx==0 else False,
+            collective_op_set=None if not collective_op_sets else collective_op_sets[0],
         )
         setattr(self, dense_name, module)
     self.dropout = Dropout(rate=self.intermediate_dropout_rate, broadcast_dims=(-2,), rngs=rngs)
@@ -427,6 +459,8 @@ class MlpBlock(nnx.Module):
         use_bias=self.use_bias,
         matmul_precision=self.config.matmul_precision,
         rngs=rngs,
+        use_te_comm_gemm_overlap=self.config.use_te_comm_gemm_overlap,
+        collective_op_set=None if not collective_op_sets else collective_op_sets[1],
     )
 
     # Initialization must occur after the model params have been created for self.wi and self.wo

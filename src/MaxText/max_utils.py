@@ -210,6 +210,23 @@ def maybe_initialize_jax_distributed_system(raw_keys):
         initialize_jax_for_tpu_with_emergency_checkpointing(raw_keys)
     max_logging.log("Jax distributed system initialized!")
 
+def initialize_transformer_engine_comm_gemm_overlap(raw_keys):
+  """Initialize TransformerEngine comm gemm overlap."""
+  try:
+    import transformer_engine.jax as te
+    from transformer_engine.jax.cpp_extensions.gemm import collective_gemm_bootstrap
+
+  except ImportError:
+    print("TransformerEngine Comm Gemm Overlap is not available")
+
+  if raw_keys["use_te_comm_gemm_overlap"]:
+    max_logging.log("Initializing TransformerEngine comm gemm overlap...")
+    collective_gemm_bootstrap(
+        num_total_devices=jax.process_count(),
+        num_devices_per_process=1,
+        process_id=jax.process_index(),
+        tensor_parallel_size=raw_keys["ici_tensor_sequence_parallelism"],
+    )
 
 def initialize_jax_for_gpu(raw_keys):
   """Jax distributed initialize for GPUs."""

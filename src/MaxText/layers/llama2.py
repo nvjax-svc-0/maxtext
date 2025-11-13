@@ -97,7 +97,11 @@ class LlamaDecoderLayer(nnx.Module):
         rngs=rngs,
     )
 
-    use_te = self.config.quantization.startswith("te_")
+    if self.config.quantization is None:
+        use_te = False
+    else:
+        use_te = self.config.quantization.startswith("te_")
+
     if not use_te:
         self.post_self_attention_layer_norm = RMSNorm(
             num_features=config.emb_dim,
@@ -107,6 +111,13 @@ class LlamaDecoderLayer(nnx.Module):
             epsilon=config.normalization_layer_epsilon,
             rngs=rngs,
         )
+
+    if config.use_te_comm_gemm_overlap:
+        collective_op_set1 = CollectiveOpSet.create(forward_collective_op=CollectiveOp.ALL_GATHER)
+        collective_op_set2 = CollectiveOpSet.create(forward_collective_op=CollectiveOp.REDUCE_SCATTER)
+        collective_op_sets = (collective_op_set1, collective_op_set2)
+    else:
+        collective_op_sets = None
 
     self.mlp = MlpBlock(
         in_features=config.emb_dim,
@@ -120,6 +131,7 @@ class LlamaDecoderLayer(nnx.Module):
         model_mode=model_mode,
         rngs=rngs,
         use_pre_norm=use_te,
+        collective_op_sets=collective_op_sets,
     )
 
     self.dropout = Dropout(rate=config.dropout_rate, broadcast_dims=(-2,), rngs=rngs)
@@ -164,7 +176,11 @@ class LlamaDecoderLayer(nnx.Module):
     attention_lnx = nn.with_logical_constraint(attention_lnx, self.activation_axis_names)
     intermediate_inputs = inputs + attention_lnx
 
-    use_te = self.config.quantization.startswith("te_")
+    if self.config.quantization is None:
+        use_te = False
+    else:
+        use_te = self.config.quantization.startswith("te_")
+
     if use_te:
         mlp_lnx = self.mlp(intermediate_inputs, deterministic=deterministic)
     else:
