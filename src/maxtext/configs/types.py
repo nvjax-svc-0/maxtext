@@ -6000,8 +6000,13 @@ class MaxTextConfig(
           )
         if self.use_2d_fsdp_sharding:
           raise ValueError("te_moe_quantize_before_fsdp_all_gather=True does not support 2D FSDP weight sharding.")
-      if self.te_moe_block and not self.prefuse_moe_weights:
+      if self.te_moe_block and not self.prefuse_moe_weights and self.decoder_block != DecoderBlockType.KIMI_LINEAR:
         raise ValueError("te_moe_block=True requires prefuse_moe_weights=True.")
+      if self.te_moe_block and self.decoder_block == DecoderBlockType.KIMI_LINEAR:
+        if self.quantization:
+          raise ValueError("Kimi-K3 TE MoE requires quantization=''; select expert precision with te_gmm_quantization.")
+        if self.ragged_buffer_factor > 0:
+          raise ValueError("Kimi-K3 TE MoE requires ragged_buffer_factor<=0 for dropless worst-case capacity.")
       if self.te_moe_block and self.routed_bias_update_rate > 0.0:
         raise ValueError("te_moe_block=True does not currently support routed_bias_update_rate > 0.")
       if self.te_moe_block and self.norm_topk_prob:

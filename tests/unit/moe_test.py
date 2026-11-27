@@ -5516,14 +5516,129 @@ class RoutedMoeRouterInputAndUpActivationTest(parameterized.TestCase):
         return self._overrides[name] if name in self._overrides else getattr(self._base, name)
 
     situ_cfg = self._cfg(mlp_activations=["situ_gate", "situ_linear"])
+    te_situ, _ = self._block(_WithOverrides(situ_cfg, te_moe_block=True))
+    self.assertTrue(te_situ.is_situ_glu)
     for overrides, msg in (
-        ({"te_moe_block": True}, "fused MoE kernels"),
         ({"attention": "vllm_rpa"}, "fused MoE kernels"),
         ({"decoder_block": DecoderBlockType.GPT_OSS}, "clipped-SwiGLU"),
         ({"mlp_activations_limit": 7.0}, "clipped-SwiGLU"),
     ):
       with self.subTest(**{k: str(v) for k, v in overrides.items()}), self.assertRaisesRegex(ValueError, msg):
         self._block(_WithOverrides(situ_cfg, **overrides))
+
+    other_up_cfg = self._cfg(mlp_activations=["silu", "situ_linear"])
+    with self.assertRaisesRegex(ValueError, "fused MoE kernels"):
+      self._block(_WithOverrides(other_up_cfg, te_moe_block=True))
+
+  def test_te_moe_block_passes_situglu_and_split_weights(self):
+    """TE MoEBlock forwards `activation_type='situglu'`, late weighting, and concatenated split FC1 weights."""
+    import dataclasses  # pylint: disable=import-outside-toplevel
+    import sys  # pylint: disable=import-outside-toplevel
+    import types  # pylint: disable=import-outside-toplevel
+    from unittest import mock  # pylint: disable=import-outside-toplevel
+
+    class _WithOverrides:
+
+      def __init__(self, base, **overrides):
+        self._base, self._overrides = base, overrides
+
+      def __getattr__(self, name):
+        return self._overrides[name] if name in self._overrides else getattr(self._base, name)
+
+    cfg = _WithOverrides(
+        self._cfg(mlp_activations=["situ_gate", "situ_linear"], prefuse_moe_weights=False),
+        te_moe_block=True,
+        te_gmm_quantization="te_no_quant",
+    )
+    block, mesh = self._block(cfg)
+    self.assertIsNone(block.quant)
+
+    captured = {}
+
+    @dataclasses.dataclass
+    class _FakeRouterComputationInfo:
+      gate_kernel: object
+      num_experts_per_tok: int
+      expert_bias: object = None
+      score_function: str = "softmax"
+      use_pre_softmax: bool = False
+      num_groups: object = None
+      group_topk: object = None
+      scaling_factor: float = 1.0
+      aux_loss_coeff: float = 0.0
+      gate_kernel_axes: tuple = ()
+
+    def _fake_moe(
+        x,
+        *,
+        router_info,
+        wi,
+        wo,
+        num_experts,
+        activation_type="silu",
+        apply_topk_weights_early=False,
+        dtype=jnp.float32,
+        collect_expert_counts=True,
+        use_cudnn_fusion=True,
+        cudnn_native_weight_layout=None,
+        **_extra,
+    ):
+      captured.update(
+          router_info=router_info,
+          wi=wi,
+          wo=wo,
+          activation_type=activation_type,
+          apply_topk_weights_early=apply_topk_weights_early,
+          collect_expert_counts=collect_expert_counts,
+          use_cudnn_fusion=use_cudnn_fusion,
+          cudnn_native_weight_layout=cudnn_native_weight_layout,
+      )
+      return (
+          jnp.zeros_like(x, dtype=dtype),
+          jnp.asarray(0.0, dtype=dtype),
+          jnp.asarray(0, dtype=jnp.int32),
+          jnp.zeros((num_experts,), dtype=jnp.int32),
+      )
+
+    fake_te_moe = types.ModuleType("transformer_engine.jax.moe")
+    fake_te_moe.RouterComputationInfo = _FakeRouterComputationInfo
+    fake_te_moe.moe = _fake_moe
+    fake_te_sharding = types.ModuleType("transformer_engine.jax.sharding")
+    fake_te_sharding.MeshResource = lambda **kw: SimpleNamespace(**kw)
+    fake_te_jax = types.ModuleType("transformer_engine.jax")
+    fake_te_jax.moe = fake_te_moe
+    fake_te_jax.sharding = fake_te_sharding
+    fake_te = types.ModuleType("transformer_engine")
+    fake_te.jax = fake_te_jax
+
+    batch = int(cfg.per_device_batch_size) * jax.device_count()
+    x = jnp.ones((batch, self._SEQ, self._EMB), dtype=jnp.float32)
+    fake_modules = {
+        "transformer_engine": fake_te,
+        "transformer_engine.jax": fake_te_jax,
+        "transformer_engine.jax.moe": fake_te_moe,
+        "transformer_engine.jax.sharding": fake_te_sharding,
+    }
+    with (
+        mock.patch.dict(sys.modules, fake_modules),
+        mock.patch.object(
+            moe.quantizations.TransformerEngineQuantization,
+            "get_moe_block_quantizer_sets",
+            return_value=("fc1_q", "fc2_q"),
+        ),
+        mock.patch.object(moe.max_utils, "get_te_moe_recv_capacity_per_rank", return_value=256),
+        mesh,
+    ):
+      out, _, _ = block(x)
+
+    self.assertEqual(out.shape, x.shape)
+    self.assertEqual(captured["activation_type"], "situglu")
+    self.assertFalse(captured["apply_topk_weights_early"])
+    self.assertFalse(captured["cudnn_native_weight_layout"])
+    self.assertFalse(captured["collect_expert_counts"])
+    self.assertIsInstance(captured["router_info"], _FakeRouterComputationInfo)
+    expected_wi = jnp.concatenate((block.wi_0[...], block.wi_1[...]), axis=-1)
+    np.testing.assert_array_equal(captured["wi"], expected_wi)
 
   @parameterized.named_parameters(("sparse_ragged_dot", True), ("dense", False))
   def test_router_reads_gate_inputs_of_a_different_width(self, sparse_matmul):

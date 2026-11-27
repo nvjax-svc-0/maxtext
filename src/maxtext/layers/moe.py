@@ -106,6 +106,13 @@ def _get_te_moe_cudnn_gmm_fusion_kwargs(disable_cudnn_gmm_fusion: bool) -> dict[
   return {"use_cudnn_fusion": False} if disable_cudnn_gmm_fusion else {}
 
 
+def _get_te_moe_weight_layout_kwargs(moe_fn) -> dict[str, bool]:
+  """Declare MaxText's standard [E, K, 2N] FC1 storage when TE accepts the layout flag."""
+  if "cudnn_native_weight_layout" in inspect.signature(moe_fn).parameters:
+    return {"cudnn_native_weight_layout": False}
+  return {}
+
+
 @struct.dataclass
 class RouteMetadata:
   """EP communication state needed to undo the forward all-to-all after expert computation."""
@@ -1122,7 +1129,7 @@ class RoutedMoE(nnx.Module):
     self.up_activation_fn = linears._convert_to_activation_function(self.up_activation_name)
     self.is_situ_glu = (self.config.mlp_activations[0], self.up_activation_name) == ("situ_gate", "situ_linear")
     if self.up_activation_name != "linear" and (
-        self.config.te_moe_block or self.config.attention in ("vllm_rpa", "vllm_batched_rpa")
+        (self.config.te_moe_block and not self.is_situ_glu) or self.config.attention in ("vllm_rpa", "vllm_batched_rpa")
     ):
       raise ValueError(
           f"mlp_activations[1]={self.up_activation_name!r} is not supported by the fused MoE kernels"
@@ -5126,8 +5133,8 @@ class RoutedMoE(nnx.Module):
           "Please upgrade to the latest version of TransformerEngine."
       ) from exc
 
-    if self.quant is None or not hasattr(self.quant, "get_moe_block_quantizer_sets"):
-      raise ValueError("te_moe_block=True requires TransformerEngine quantization or te_gmm_quantization=te_no_quant.")
+    if not self.config.te_gmm_quantization:
+      raise ValueError("te_moe_block=True requires te_gmm_quantization (te_no_quant or te_mxfp8).")
 
     expert_bias = None
     if self.config.routed_bias:
@@ -5143,7 +5150,12 @@ class RoutedMoE(nnx.Module):
     if self.num_experts % ep_size != 0:
       raise ValueError(f"num_experts={self.num_experts} must be divisible by EP size={ep_size}.")
 
-    fc1_quantizer_set, fc2_quantizer_set = self.quant.get_moe_block_quantizer_sets(
+    get_quantizer_sets = (
+        self.quant.get_moe_block_quantizer_sets
+        if self.quant is not None and hasattr(self.quant, "get_moe_block_quantizer_sets")
+        else quantizations.TransformerEngineQuantization.get_moe_block_quantizer_sets
+    )
+    fc1_quantizer_set, fc2_quantizer_set = get_quantizer_sets(
         self.config.te_gmm_quantization,
         # Dispatch buffers have one group per (fsdp, ep, local_expert),
         # while model weights retain their global expert-group descriptor.
@@ -5154,38 +5166,68 @@ class RoutedMoE(nnx.Module):
 
     checkpoint_kwargs = _get_te_moe_checkpoint_kwargs(te_moe.moe)
     cudnn_gmm_fusion_kwargs = _get_te_moe_cudnn_gmm_fusion_kwargs(self.config.te_moe_disable_cudnn_gmm_fusion)
+    weight_layout_kwargs = _get_te_moe_weight_layout_kwargs(te_moe.moe)
+    activation_type = "situglu" if self.is_situ_glu else self.config.mlp_activations[0]
 
-    output, lb_loss, total_recv_tokens = te_moe.moe(
+    # Older TE versions take the router arguments directly and do not return expert counts.
+    supports_router_info = hasattr(te_moe, "RouterComputationInfo")
+    if supports_router_info:
+      router_kwargs = {
+          "router_info": te_moe.RouterComputationInfo(
+              gate_kernel=gate_kernel,
+              num_experts_per_tok=self.num_experts_per_tok,
+              expert_bias=expert_bias,
+              score_function=self.config.routed_score_func or "softmax",
+              use_pre_softmax=False,
+              num_groups=None if self.config.n_routing_groups <= 0 else self.config.n_routing_groups,
+              group_topk=None if self.config.topk_routing_group <= 0 else self.config.topk_routing_group,
+              scaling_factor=self.config.routed_scaling_factor,
+              aux_loss_coeff=self.config.load_balance_loss_weight,
+              gate_kernel_axes=self.kernel_axes,
+          ),
+          "collect_expert_counts": False,
+      }
+    else:
+      router_kwargs = {
+          "gate_kernel": gate_kernel,
+          "num_experts_per_tok": self.num_experts_per_tok,
+          "expert_bias": expert_bias,
+          "score_function": self.config.routed_score_func or "softmax",
+          "use_pre_softmax": False,
+          "num_groups": None if self.config.n_routing_groups <= 0 else self.config.n_routing_groups,
+          "group_topk": None if self.config.topk_routing_group <= 0 else self.config.topk_routing_group,
+          "scaling_factor": self.config.routed_scaling_factor,
+          "aux_loss_coeff": self.config.load_balance_loss_weight,
+          "gate_kernel_axes": self.kernel_axes,
+      }
+
+    te_moe_outputs = te_moe.moe(
         inputs,
-        gate_kernel,
-        wi_kernel,
-        wo_kernel,
-        w0_bias,
-        w1_bias,
-        wo_bias,
-        expert_bias,
+        wi=wi_kernel,
+        wo=wo_kernel,
+        wi_0_bias=w0_bias,
+        wi_1_bias=w1_bias,
+        wo_bias=wo_bias,
         num_experts=self.num_experts,
-        num_experts_per_tok=self.num_experts_per_tok,
-        activation_type=self.config.mlp_activations[0],
-        score_function=self.config.routed_score_func or "softmax",
-        use_pre_softmax=False,
-        num_groups=None if self.config.n_routing_groups <= 0 else self.config.n_routing_groups,
-        group_topk=None if self.config.topk_routing_group <= 0 else self.config.topk_routing_group,
-        scaling_factor=self.config.routed_scaling_factor,
-        aux_loss_coeff=self.config.load_balance_loss_weight,
-        apply_topk_weights_early=True,
+        activation_type=activation_type,
+        apply_topk_weights_early=not self.is_situ_glu,
         quantizer_sets=(fc1_quantizer_set, fc2_quantizer_set),
         mesh_resource=MeshResource(dp_resource="data", fsdp_resource="fsdp", ep_resource=self._expert_parallelism_name),
         input_axes=("activation_batch", "activation_norm_length", None),
-        gate_kernel_axes=self.kernel_axes,
         wi_kernel_axes=self.wi_kernel_axes,
         wo_kernel_axes=self.wo_kernel_axes,
         dtype=self.dtype,
         recv_capacity_per_rank=max_utils.get_te_moe_recv_capacity_per_rank(),
         quant_before_fsdp_ag=self.config.te_moe_quantize_before_fsdp_all_gather,
+        **router_kwargs,
         **cudnn_gmm_fusion_kwargs,
+        **weight_layout_kwargs,
         **checkpoint_kwargs,
     )
+    if supports_router_info:
+      output, lb_loss, total_recv_tokens, _ = te_moe_outputs
+    else:
+      output, lb_loss, total_recv_tokens = te_moe_outputs
     recv_capacity_per_rank = max_utils.get_te_moe_recv_capacity_per_rank()
     output = output.astype(self.dtype)
     if lb_loss is not None:
@@ -5233,7 +5275,12 @@ class RoutedMoE(nnx.Module):
 
     if cfg.te_moe_block:
       gate_kernel = jnp.asarray(self.gate.kernel[...], self.dtype)
-      wi_kernel = jnp.asarray(self.wi[...], self.dtype)
+      if cfg.prefuse_moe_weights:
+        wi_kernel = jnp.asarray(self.wi[...], self.dtype)
+      else:
+        wi_kernel = jnp.concatenate(
+            (jnp.asarray(self.wi_0[...], self.dtype), jnp.asarray(self.wi_1[...], self.dtype)), axis=-1
+        )
       wo_kernel = jnp.asarray(self.wo[...], self.dtype)
       if self.per_expert_scale is not None:
         wo_kernel = wo_kernel * jnp.asarray(self.per_expert_scale[...], self.dtype)[:, None, None]
