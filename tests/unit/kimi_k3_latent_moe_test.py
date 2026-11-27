@@ -545,6 +545,37 @@ class KimiK3LatentMoETest(unittest.TestCase):
           y_jax = np.array(jax_moe(x_jax))
         np.testing.assert_allclose(y_jax, y_torch, rtol=1e-4, atol=1e-4)
 
+  def test_te_moe_block_sows_capacity_stats(self):
+    """`KimiLatentMoEBlock` sows TE MoE receive-capacity intermediates when `te_moe_block=True`."""
+    block, _, mesh = self._make_block()
+    captured = {}
+
+    class _StubRoutedMoE(nnx.Module):
+
+      def __init__(self):
+        self.config = types.SimpleNamespace(te_moe_block=True)
+
+      def __call__(self, inputs, gate_inputs=None):
+        captured["inputs_shape"] = inputs.shape
+        captured["gate_inputs_shape"] = gate_inputs.shape
+        return (
+            jnp.zeros_like(inputs),
+            None,
+            (jnp.asarray(300, dtype=jnp.int32), jnp.asarray(256, dtype=jnp.int32)),
+        )
+
+    block.routed_experts = _StubRoutedMoE()
+    x = jnp.zeros((self.batch_size, self.seq_len, self.hidden_size), dtype=jnp.float32)
+    with mesh:
+      out = block(x)
+    self.assertEqual(out.shape, x.shape)
+    self.assertEqual(captured["inputs_shape"], (self.batch_size, self.seq_len, self.routed_expert_hidden_size))
+    self.assertEqual(captured["gate_inputs_shape"], x.shape)
+    intermediates = nnx.pop(block, nnx.Intermediate).to_pure_dict()
+    self.assertEqual(int(intermediates["te_moe_total_recv_tokens"][0]), 300)
+    self.assertEqual(int(intermediates["te_moe_recv_capacity_per_rank"][0]), 256)
+    self.assertTrue(bool(intermediates["te_moe_capacity_overflow"][0]))
+
 
 if __name__ == "__main__":
   unittest.main()
