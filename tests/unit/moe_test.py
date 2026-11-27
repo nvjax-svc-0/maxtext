@@ -5582,6 +5582,154 @@ class RoutedMoeRouterInputAndUpActivationTest(parameterized.TestCase):
         _, pre_bias = gate(jnp.ones((1, 2, self._EMB), jnp.float32))
         self.assertEqual(pre_bias is not None, has_pre_bias)
 
+  def test_te_moe_block_latent_routing_uses_fused_router_and_routing_map_info(self):
+    """TE MoEBlock with separate `gate_inputs` routes via TE fused top-k and passes `RoutingMapInfo`."""
+    import dataclasses  # pylint: disable=import-outside-toplevel
+    import sys  # pylint: disable=import-outside-toplevel
+    import types  # pylint: disable=import-outside-toplevel
+    from unittest import mock  # pylint: disable=import-outside-toplevel
+
+    class _WithOverrides:
+
+      def __init__(self, base, **overrides):
+        self._base, self._overrides = base, overrides
+
+      def __getattr__(self, name):
+        return self._overrides[name] if name in self._overrides else getattr(self._base, name)
+
+    base_cfg = self._cfg(
+        moe_expert_input_dim=self._LATENT,
+        moe_router_input_dim=self._EMB,
+        mlp_activations=["silu"],
+        prefuse_moe_weights=True,
+        routed_score_func="sigmoid",
+        routed_bias=True,
+        routed_scaling_factor=2.5,
+        load_balance_loss_weight=0.0,
+    )
+    cfg = _WithOverrides(base_cfg, te_moe_block=True, te_gmm_quantization="te_no_quant")
+    block, mesh = self._block(cfg)
+    block.quant = SimpleNamespace(get_moe_block_quantizer_sets=lambda *args, **kwargs: ("fc1_q", "fc2_q"))
+
+    captured_router = {}
+    captured_moe = {}
+
+    @dataclasses.dataclass
+    class _FakeRouterComputationInfo:
+      gate_kernel: object
+      num_experts_per_tok: int
+      expert_bias: object = None
+      score_function: str = "softmax"
+      use_pre_softmax: bool = False
+      num_groups: object = None
+      group_topk: object = None
+      scaling_factor: float = 1.0
+      aux_loss_coeff: float = 0.0
+      gate_kernel_axes: tuple = ()
+
+    @dataclasses.dataclass
+    class _FakeRoutingMapInfo:
+      routing_indices: object
+      routing_weights: object
+
+    def _fake_fused_topk(
+        logits,
+        topk,
+        use_pre_softmax=False,
+        num_groups=-1,
+        group_topk=-1,
+        scaling_factor=1.0,
+        score_function="softmax",
+        expert_bias=None,
+    ):
+      captured_router.update(
+          logits=logits,
+          topk=topk,
+          use_pre_softmax=use_pre_softmax,
+          num_groups=num_groups,
+          group_topk=group_topk,
+          scaling_factor=scaling_factor,
+          score_function=score_function,
+          expert_bias=expert_bias,
+      )
+      scores = jax.nn.sigmoid(logits)
+      biased = scores + expert_bias if expert_bias is not None else scores
+      _, top_idx = jax.lax.top_k(biased, topk)
+      routing_map = jnp.any(jax.nn.one_hot(top_idx, logits.shape[-1], dtype=jnp.bool_), axis=1)
+      selected_scores = jnp.where(routing_map, scores, 0.0)
+      denom = jnp.sum(selected_scores, axis=-1, keepdims=True) + 1e-20
+      sparse_probs = selected_scores / denom * scaling_factor
+      return sparse_probs, routing_map
+
+    def _fake_moe(x, *, router_info, num_experts, dtype=jnp.float32, **_kwargs):
+      captured_moe.update(x=x, router_info=router_info)
+      return (
+          jnp.zeros_like(x, dtype=dtype),
+          None,
+          jnp.asarray(0, dtype=jnp.int32),
+          jnp.zeros((num_experts,), dtype=jnp.int32),
+      )
+
+    fake_te_moe = types.ModuleType("transformer_engine.jax.moe")
+    fake_te_moe.RouterComputationInfo = _FakeRouterComputationInfo
+    fake_te_moe.RoutingMapInfo = _FakeRoutingMapInfo
+    fake_te_moe.moe = _fake_moe
+    fake_te_router = types.ModuleType("transformer_engine.jax.router")
+    fake_te_router.fused_topk_with_score_function = _fake_fused_topk
+    fake_te_sharding = types.ModuleType("transformer_engine.jax.sharding")
+    fake_te_sharding.MeshResource = lambda **kw: SimpleNamespace(**kw)
+    fake_te_jax = types.ModuleType("transformer_engine.jax")
+    fake_te_jax.moe = fake_te_moe
+    fake_te_jax.router = fake_te_router
+    fake_te_jax.sharding = fake_te_sharding
+    fake_te = types.ModuleType("transformer_engine")
+    fake_te.jax = fake_te_jax
+
+    batch = int(cfg.per_device_batch_size) * jax.device_count()
+    k1, k2 = jax.random.split(jax.random.PRNGKey(0))
+    x = jax.random.normal(k1, (batch, self._SEQ, self._LATENT), jnp.float32)
+    h = jax.random.normal(k2, (batch, self._SEQ, self._EMB), jnp.float32)
+
+    fake_modules = {
+        "transformer_engine": fake_te,
+        "transformer_engine.jax": fake_te_jax,
+        "transformer_engine.jax.moe": fake_te_moe,
+        "transformer_engine.jax.router": fake_te_router,
+        "transformer_engine.jax.sharding": fake_te_sharding,
+    }
+    with (
+        mock.patch.dict(sys.modules, fake_modules),
+        mock.patch.object(moe.max_utils, "get_te_moe_recv_capacity_per_rank", return_value=256),
+        mesh,
+    ):
+      out, lb_loss, _ = block(x, gate_inputs=h)
+
+    self.assertEqual(out.shape, x.shape)
+    self.assertIsNone(lb_loss)
+    expected_logits = jnp.einsum("bsh,he->bse", h, block.gate.kernel[...]).reshape(-1, self._E)
+    np.testing.assert_allclose(captured_router["logits"], expected_logits, rtol=1e-5, atol=1e-6)
+    self.assertEqual(captured_router["score_function"], "sigmoid")
+    self.assertEqual(captured_router["scaling_factor"], 2.5)
+    self.assertIsInstance(captured_moe["router_info"], _FakeRoutingMapInfo)
+    self.assertEqual(captured_moe["x"].shape, x.shape)
+    self.assertEqual(captured_moe["router_info"].routing_indices.shape, (batch, self._SEQ, self._K))
+    self.assertEqual(captured_moe["router_info"].routing_indices.dtype, jnp.int32)
+    self.assertEqual(captured_moe["router_info"].routing_weights.shape, (batch, self._SEQ, self._K))
+
+    lb_cfg = _WithOverrides(cfg, load_balance_loss_weight=0.01)
+    lb_block, _ = self._block(lb_cfg)
+    with self.assertRaisesRegex(ValueError, "load_balance_loss_weight=0"):
+      lb_block(x, gate_inputs=h)
+
+    delattr(fake_te_moe, "RoutingMapInfo")
+    with (
+        mock.patch.dict(sys.modules, fake_modules),
+        mock.patch.object(moe.max_utils, "get_te_moe_recv_capacity_per_rank", return_value=256),
+        mesh,
+        self.assertRaisesRegex(ImportError, "RoutingMapInfo"),
+    ):
+      block(x, gate_inputs=h)
+
 
 if __name__ == "__main__":
   absltest.main()

@@ -302,7 +302,12 @@ class KimiLatentMoEBlock(nnx.Module):
 
     # Down-project to the latent (7168 -> 3584); the router reads the full hidden state.
     x_latent = self.routed_expert_down_proj(hidden_states)
-    y_routed, _, _ = self.routed_experts(x_latent, gate_inputs=hidden_states)
+    y_routed, _, routing_stats = self.routed_experts(x_latent, gate_inputs=hidden_states)
+    if self.routed_experts.config.te_moe_block and routing_stats is not None:
+      total_recv_tokens, capacity = routing_stats
+      self.sow(nnx.Intermediate, "te_moe_total_recv_tokens", total_recv_tokens)
+      self.sow(nnx.Intermediate, "te_moe_recv_capacity_per_rank", capacity)
+      self.sow(nnx.Intermediate, "te_moe_capacity_overflow", jnp.any(total_recv_tokens > capacity))
 
     # Post-expert RMSNorm
     if self.routed_expert_norm is not None:

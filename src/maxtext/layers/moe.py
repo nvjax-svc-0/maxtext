@@ -5105,6 +5105,41 @@ class RoutedMoE(nnx.Module):
     wo_kernel = max_utils.unbox_logicallypartioned(wo_kernel)
     return w0_kernel, w1_kernel, wo_kernel
 
+  def _te_fused_router_map(
+      self,
+      routing_inputs: jax.Array,
+      gate_kernel: jax.Array,
+      expert_bias: jax.Array | None,
+  ) -> tuple[jax.Array, jax.Array]:
+    """Compute top-k routing indices and weights on separate router inputs via TE's fused router."""
+    try:
+      from transformer_engine.jax import router as te_router  # pylint: disable=import-outside-toplevel
+    except ImportError as exc:
+      raise ImportError(
+          "te_moe_block=True with separate gate_inputs requires TransformerEngine with "
+          "transformer_engine.jax.router.fused_topk_with_score_function. Please upgrade TransformerEngine."
+      ) from exc
+
+    gate_logits = jnp.einsum("...h,he->...e", routing_inputs, gate_kernel)
+    logits_2d = gate_logits.reshape(-1, self.num_experts).astype(jnp.float32)
+    sparse_probs, routing_map = te_router.fused_topk_with_score_function(
+        logits_2d,
+        topk=self.num_experts_per_tok,
+        use_pre_softmax=False,
+        num_groups=-1 if self.config.n_routing_groups <= 0 else self.config.n_routing_groups,
+        group_topk=-1 if self.config.topk_routing_group <= 0 else self.config.topk_routing_group,
+        scaling_factor=self.config.routed_scaling_factor,
+        score_function=self.config.routed_score_func or "softmax",
+        expert_bias=expert_bias,
+    )
+    # argsort on bool places True last, so the trailing K indices are the selected experts.
+    selected_experts = jnp.argsort(routing_map, axis=-1)[..., -self.num_experts_per_tok :]
+    routing_weights = jnp.take_along_axis(sparse_probs, selected_experts, axis=-1)
+    leading_shape = routing_inputs.shape[:-1]
+    routing_indices = selected_experts.reshape(*leading_shape, self.num_experts_per_tok).astype(jnp.int32)
+    routing_weights = routing_weights.reshape(*leading_shape, self.num_experts_per_tok)
+    return routing_indices, routing_weights
+
   def _te_moe_block(
       self,
       inputs: jax.Array,
@@ -5115,6 +5150,7 @@ class RoutedMoE(nnx.Module):
       w1_bias: jax.Array | None,
       wo_bias: jax.Array | None,
       out_sharding: NamedSharding | None = None,
+      router_inputs: jax.Array | None = None,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     """Run TransformerEngine's fused EP MoEBlock using MaxText-owned params."""
     try:
@@ -5155,37 +5191,78 @@ class RoutedMoE(nnx.Module):
     checkpoint_kwargs = _get_te_moe_checkpoint_kwargs(te_moe.moe)
     cudnn_gmm_fusion_kwargs = _get_te_moe_cudnn_gmm_fusion_kwargs(self.config.te_moe_disable_cudnn_gmm_fusion)
 
-    output, lb_loss, total_recv_tokens = te_moe.moe(
+    # Older TE versions take the router arguments directly and do not return expert counts.
+    supports_router_info = hasattr(te_moe, "RouterComputationInfo")
+    if router_inputs is not None:
+      if not supports_router_info or not hasattr(te_moe, "RoutingMapInfo"):
+        raise ImportError(
+            "te_moe_block=True with separate gate_inputs requires TransformerEngine with "
+            "moe.RoutingMapInfo support. Please upgrade TransformerEngine."
+        )
+      routing_indices, routing_weights = self._te_fused_router_map(router_inputs, gate_kernel, expert_bias)
+      router_kwargs = {
+          "router_info": te_moe.RoutingMapInfo(
+              routing_indices=routing_indices,
+              routing_weights=routing_weights,
+          ),
+          "collect_expert_counts": False,
+      }
+    elif supports_router_info:
+      router_kwargs = {
+          "router_info": te_moe.RouterComputationInfo(
+              gate_kernel=gate_kernel,
+              num_experts_per_tok=self.num_experts_per_tok,
+              expert_bias=expert_bias,
+              score_function=self.config.routed_score_func or "softmax",
+              use_pre_softmax=False,
+              num_groups=None if self.config.n_routing_groups <= 0 else self.config.n_routing_groups,
+              group_topk=None if self.config.topk_routing_group <= 0 else self.config.topk_routing_group,
+              scaling_factor=self.config.routed_scaling_factor,
+              aux_loss_coeff=self.config.load_balance_loss_weight,
+              gate_kernel_axes=self.kernel_axes,
+          ),
+          "collect_expert_counts": False,
+      }
+    else:
+      router_kwargs = {
+          "gate_kernel": gate_kernel,
+          "num_experts_per_tok": self.num_experts_per_tok,
+          "expert_bias": expert_bias,
+          "score_function": self.config.routed_score_func or "softmax",
+          "use_pre_softmax": False,
+          "num_groups": None if self.config.n_routing_groups <= 0 else self.config.n_routing_groups,
+          "group_topk": None if self.config.topk_routing_group <= 0 else self.config.topk_routing_group,
+          "scaling_factor": self.config.routed_scaling_factor,
+          "aux_loss_coeff": self.config.load_balance_loss_weight,
+          "gate_kernel_axes": self.kernel_axes,
+      }
+
+    te_moe_outputs = te_moe.moe(
         inputs,
-        gate_kernel,
-        wi_kernel,
-        wo_kernel,
-        w0_bias,
-        w1_bias,
-        wo_bias,
-        expert_bias,
+        wi=wi_kernel,
+        wo=wo_kernel,
+        wi_0_bias=w0_bias,
+        wi_1_bias=w1_bias,
+        wo_bias=wo_bias,
         num_experts=self.num_experts,
-        num_experts_per_tok=self.num_experts_per_tok,
         activation_type=self.config.mlp_activations[0],
-        score_function=self.config.routed_score_func or "softmax",
-        use_pre_softmax=False,
-        num_groups=None if self.config.n_routing_groups <= 0 else self.config.n_routing_groups,
-        group_topk=None if self.config.topk_routing_group <= 0 else self.config.topk_routing_group,
-        scaling_factor=self.config.routed_scaling_factor,
-        aux_loss_coeff=self.config.load_balance_loss_weight,
         apply_topk_weights_early=True,
         quantizer_sets=(fc1_quantizer_set, fc2_quantizer_set),
         mesh_resource=MeshResource(dp_resource="data", fsdp_resource="fsdp", ep_resource=self._expert_parallelism_name),
         input_axes=("activation_batch", "activation_norm_length", None),
-        gate_kernel_axes=self.kernel_axes,
         wi_kernel_axes=self.wi_kernel_axes,
         wo_kernel_axes=self.wo_kernel_axes,
         dtype=self.dtype,
         recv_capacity_per_rank=max_utils.get_te_moe_recv_capacity_per_rank(),
         quant_before_fsdp_ag=self.config.te_moe_quantize_before_fsdp_all_gather,
+        **router_kwargs,
         **cudnn_gmm_fusion_kwargs,
         **checkpoint_kwargs,
     )
+    if supports_router_info:
+      output, lb_loss, total_recv_tokens, _ = te_moe_outputs
+    else:
+      output, lb_loss, total_recv_tokens = te_moe_outputs
     recv_capacity_per_rank = max_utils.get_te_moe_recv_capacity_per_rank()
     output = output.astype(self.dtype)
     if lb_loss is not None:
@@ -5218,8 +5295,6 @@ class RoutedMoE(nnx.Module):
     cfg = self.config
     inputs = inputs.astype(cfg.dtype)
 
-    if cfg.te_moe_block and gate_inputs is not None:
-      raise ValueError("te_moe_block=True does not support separate gate_inputs.")
     if gate_inputs is None and self.moe_router_input_dim != self.moe_expert_input_dim:
       raise ValueError(
           f"moe_router_input_dim={self.moe_router_input_dim} differs from the expert input dim"
@@ -5232,7 +5307,9 @@ class RoutedMoE(nnx.Module):
     routing_inputs = inputs if gate_inputs is None else gate_inputs.astype(gate_dtype)
 
     if cfg.te_moe_block:
-      gate_kernel = jnp.asarray(self.gate.kernel[...], self.dtype)
+      if gate_inputs is not None and cfg.load_balance_loss_weight > 0.0:
+        raise ValueError("te_moe_block=True with separate gate_inputs requires load_balance_loss_weight=0.")
+      gate_kernel = jnp.asarray(self.gate.kernel[...], gate_dtype if gate_inputs is not None else self.dtype)
       wi_kernel = jnp.asarray(self.wi[...], self.dtype)
       wo_kernel = jnp.asarray(self.wo[...], self.dtype)
       if self.per_expert_scale is not None:
@@ -5252,6 +5329,7 @@ class RoutedMoE(nnx.Module):
           w1_bias,
           wo_bias,
           out_sharding,
+          router_inputs=routing_inputs if gate_inputs is not None else None,
       )
 
     gate_logits, pre_bias_logits = self.gate(routing_inputs)
